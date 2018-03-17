@@ -45,10 +45,10 @@ namespace Serilog.Sinks.MSSqlServer
 
         readonly string _connectionString;
 
-        readonly DataTable _eventsTable;
+        private DataTable _eventsTable;
         readonly IFormatProvider _formatProvider;
         readonly string _tableName;
-        readonly CancellationTokenSource _token = new CancellationTokenSource();
+        readonly string _schemaName;
         private readonly ColumnOptions _columnOptions;
 
         private readonly HashSet<string> _additionalDataColumnNames;
@@ -61,6 +61,7 @@ namespace Serilog.Sinks.MSSqlServer
         /// </summary>
         /// <param name="connectionString">Connection string to access the database.</param>
         /// <param name="tableName">Name of the table to store the data in.</param>
+        /// <param name="schemaName">Name of the schema for the table to store the data in. The default is 'dbo'.</param>
         /// <param name="batchPostingLimit">The maximum number of events to post in a single batch.</param>
         /// <param name="period">The time to wait between checking for event batches.</param>
         /// <param name="formatProvider">Supplies culture-specific formatting information, or null.</param>
@@ -73,7 +74,8 @@ namespace Serilog.Sinks.MSSqlServer
             TimeSpan period,
             IFormatProvider formatProvider,
             bool autoCreateSqlTable = false,
-            ColumnOptions columnOptions = null
+            ColumnOptions columnOptions = null,
+            string schemaName = "dbo"
             )
             : base(batchPostingLimit, period)
         {
@@ -85,6 +87,7 @@ namespace Serilog.Sinks.MSSqlServer
 
             _connectionString = connectionString;
             _tableName = tableName;
+            _schemaName = schemaName;
             _formatProvider = formatProvider;
             _columnOptions = columnOptions ?? new ColumnOptions();
             if (_columnOptions.AdditionalDataColumns != null)
@@ -100,7 +103,7 @@ namespace Serilog.Sinks.MSSqlServer
             {
                 try
                 {
-                    SqlTableCreator tableCreator = new SqlTableCreator(connectionString);
+                    SqlTableCreator tableCreator = new SqlTableCreator(connectionString, _schemaName);
                     tableCreator.CreateTable(_eventsTable);
                 }
                 catch (Exception ex)
@@ -129,10 +132,13 @@ namespace Serilog.Sinks.MSSqlServer
             {
                 using (var cn = new SqlConnection(_connectionString))
                 {
-                    await cn.OpenAsync(_token.Token).ConfigureAwait(false);
-                    using (var copy = new SqlBulkCopy(cn))
+                    await cn.OpenAsync().ConfigureAwait(false);
+                    using (var copy = _columnOptions.DisableTriggers
+                            ? new SqlBulkCopy(cn)
+                            : new SqlBulkCopy(cn, SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers, null)
+                    )
                     {
-                        copy.DestinationTableName = _tableName;
+                        copy.DestinationTableName = string.Format("[{0}].[{1}]", _schemaName, _tableName);
                         foreach (var column in _eventsTable.Columns)
                         {
                             var columnName = ((DataColumn)column).ColumnName;
@@ -140,9 +146,8 @@ namespace Serilog.Sinks.MSSqlServer
                             copy.ColumnMappings.Add(mapping);
                         }
 
-                        await copy.WriteToServerAsync(_eventsTable, _token.Token).ConfigureAwait(false);
+                        await copy.WriteToServerAsync(_eventsTable).ConfigureAwait(false);
                     }
-
                 }
             }
             catch (Exception ex)
@@ -163,95 +168,71 @@ namespace Serilog.Sinks.MSSqlServer
             var id = new DataColumn
             {
                 DataType = Type.GetType("System.Int32"),
-                ColumnName = "Id",
+                ColumnName = !string.IsNullOrWhiteSpace(_columnOptions.Id.ColumnName) ? _columnOptions.Id.ColumnName : "Id",
                 AutoIncrement = true
             };
             eventsTable.Columns.Add(id);
 
-            if (_columnOptions.Store.Contains(StandardColumn.Message))
+            foreach (var standardColumn in _columnOptions.Store)
             {
-                var message = new DataColumn
+                switch (standardColumn)
                 {
-                    DataType = typeof (string),
-                    MaxLength = -1,
-                    ColumnName = "Message"
-                };
-                eventsTable.Columns.Add(message);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.MessageTemplate))
-            {
-                var messageTemplate = new DataColumn
-                {
-                    DataType = typeof (string),
-                    MaxLength = -1,
-                    ColumnName = "MessageTemplate",
-
-                };
-                eventsTable.Columns.Add(messageTemplate);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.Level))
-            {
-                var level = new DataColumn
-                {
-                    ColumnName = "Level"
-                };
-
-                if (_columnOptions.Level.StoreAsEnum)
-                {
-                    level.DataType = typeof (byte);
+                    case StandardColumn.Level:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = _columnOptions.Level.StoreAsEnum ? typeof(byte) : typeof(string),
+                            MaxLength = _columnOptions.Level.StoreAsEnum ? -1 : 128,
+                            ColumnName = _columnOptions.Level.ColumnName ?? StandardColumn.Level.ToString()
+                        });
+                        break;
+                    case StandardColumn.TimeStamp:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(DateTime),
+                            ColumnName = _columnOptions.TimeStamp.ColumnName ?? StandardColumn.TimeStamp.ToString(),
+                            AllowDBNull = false
+                        });
+                        break;
+                    case StandardColumn.LogEvent:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(string),
+                            ColumnName = _columnOptions.LogEvent.ColumnName ?? StandardColumn.LogEvent.ToString()
+                        });
+                        break;
+                    case StandardColumn.Message:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(string),
+                            MaxLength = -1,
+                            ColumnName = _columnOptions.Message.ColumnName ?? StandardColumn.Message.ToString()
+                        });
+                        break;
+                    case StandardColumn.MessageTemplate:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(string),
+                            MaxLength = -1,
+                            ColumnName = _columnOptions.MessageTemplate.ColumnName ?? StandardColumn.MessageTemplate.ToString()
+                        });
+                        break;
+                    case StandardColumn.Exception:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(string),
+                            MaxLength = -1,
+                            ColumnName = _columnOptions.Exception.ColumnName ?? StandardColumn.Exception.ToString()
+                        });
+                        break;
+                    case StandardColumn.Properties:
+                        eventsTable.Columns.Add(new DataColumn
+                        {
+                            DataType = typeof(string),
+                            MaxLength = -1,
+                            ColumnName = _columnOptions.Properties.ColumnName ?? StandardColumn.Properties.ToString()
+                        });
+                        break;
                 }
-                else
-                {
-                    level.DataType = typeof (string);
-                    level.MaxLength = 128;
-                }
-
-                eventsTable.Columns.Add(level);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.TimeStamp))
-            {
-                var timestamp = new DataColumn
-                {
-                    DataType = Type.GetType("System.DateTime"),
-                    ColumnName = "TimeStamp",
-                    AllowDBNull = false
-                };
-                eventsTable.Columns.Add(timestamp);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.Exception))
-            {
-                var exception = new DataColumn
-                {
-                    DataType = typeof (string),
-                    MaxLength = -1,
-                    ColumnName = "Exception"
-                };
-                eventsTable.Columns.Add(exception);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.Properties))
-            {
-                var props = new DataColumn
-                {
-                    DataType = typeof (string),
-                    MaxLength = -1,
-                    ColumnName = "Properties",
-                };
-                eventsTable.Columns.Add(props);
-            }
-
-            if (_columnOptions.Store.Contains(StandardColumn.LogEvent))
-            {
-                var eventData = new DataColumn
-                {
-                    DataType = Type.GetType("System.String"),
-                    ColumnName = "LogEvent"
-                };
-                eventsTable.Columns.Add(eventData);
             }
 
             if (_columnOptions.AdditionalDataColumns != null)
@@ -279,27 +260,25 @@ namespace Serilog.Sinks.MSSqlServer
                     switch (column)
                     {
                         case StandardColumn.Message:
-                            row["Message"] = logEvent.RenderMessage(_formatProvider);
+                            row[_columnOptions.Message.ColumnName ?? "Message"] = logEvent.RenderMessage(_formatProvider);
                             break;
                         case StandardColumn.MessageTemplate:
-                            row["MessageTemplate"] = logEvent.MessageTemplate;
+                            row[_columnOptions.MessageTemplate.ColumnName ?? "MessageTemplate"] = logEvent.MessageTemplate;
                             break;
                         case StandardColumn.Level:
-                            row["Level"] = logEvent.Level;
+                            row[_columnOptions.Level.ColumnName ?? "Level"] = logEvent.Level;
                             break;
                         case StandardColumn.TimeStamp:
-                            row["TimeStamp"] = _columnOptions.TimeStamp.ConvertToUtc
-                                ? logEvent.Timestamp.DateTime.ToUniversalTime()
-                                : logEvent.Timestamp.DateTime;
+                            row[_columnOptions.TimeStamp.ColumnName ?? "TimeStamp"] = _columnOptions.TimeStamp.ConvertToUtc ? logEvent.Timestamp.DateTime.ToUniversalTime() : logEvent.Timestamp.DateTime;
                             break;
                         case StandardColumn.Exception:
-                            row["Exception"] = logEvent.Exception != null ? logEvent.Exception.ToString() : null;
+                            row[_columnOptions.Exception.ColumnName ?? "Exception"] = logEvent.Exception != null ? logEvent.Exception.ToString() : null;
                             break;
                         case StandardColumn.Properties:
-                            row["Properties"] = ConvertPropertiesToXmlStructure(logEvent.Properties);
+                            row[_columnOptions.Properties.ColumnName ?? "Properties"] = ConvertPropertiesToXmlStructure(logEvent.Properties);
                             break;
                         case StandardColumn.LogEvent:
-                            row["LogEvent"] = LogEventToJson(logEvent);
+                            row[_columnOptions.LogEvent.ColumnName ?? "LogEvent"] = LogEventToJson(logEvent);
                             break;
                         default:
                             throw new ArgumentOutOfRangeException();
@@ -324,6 +303,18 @@ namespace Serilog.Sinks.MSSqlServer
             if (options.ExcludeAdditionalProperties)
                 properties = properties.Where(p => !_additionalDataColumnNames.Contains(p.Key));
 
+            if (options.PropertiesFilter != null)
+            {
+                try
+                {
+                    properties = properties.Where(p => options.PropertiesFilter(p.Key));
+                }
+                catch (Exception ex)
+                {
+                    SelfLog.WriteLine("Unable to filter properties to store in {0} due to following error: {1}", this, ex);
+                }
+            }
+
             var sb = new StringBuilder();
 
             sb.AppendFormat("<{0}>", options.RootElementName);
@@ -338,15 +329,11 @@ namespace Serilog.Sinks.MSSqlServer
 
                 if (options.UsePropertyKeyAsElementName)
                 {
-                    sb.AppendFormat("<{0}>{1}</{0}>", XmlPropertyFormatter.GetValidElementName(property.Key),
-                        value);
+                    sb.AppendFormat("<{0}>{1}</{0}>", XmlPropertyFormatter.GetValidElementName(property.Key), value);
                 }
                 else
                 {
-                    sb.AppendFormat("<{0} key='{1}'>{2}</{0}>",
-                        options.PropertyElementName,
-                        property.Key,
-                        value);
+                    sb.AppendFormat("<{0} key='{1}'>{2}</{0}>", options.PropertyElementName, property.Key, value);
                 }
             }
 
@@ -357,6 +344,12 @@ namespace Serilog.Sinks.MSSqlServer
 
         private string LogEventToJson(LogEvent logEvent)
         {
+            if (_columnOptions.LogEvent.ExcludeAdditionalProperties)
+            {
+                var filteredProperties = logEvent.Properties.Where(p => !_additionalDataColumnNames.Contains(p.Key));
+                logEvent = new LogEvent(logEvent.Timestamp, logEvent.Level, logEvent.Exception, logEvent.MessageTemplate, filteredProperties.Select(x => new LogEventProperty(x.Key, x.Value)));
+            }
+
             var sb = new StringBuilder();
             using (var writer = new System.IO.StringWriter(sb))
                 _jsonFormatter.Format(logEvent, writer);
@@ -384,7 +377,7 @@ namespace Serilog.Sinks.MSSqlServer
                 if (scalarValue == null)
                 {
                     row[columnName] = property.Value.ToString();
-                    continue;                    
+                    continue;
                 }
 
                 if (scalarValue.Value == null && row.Table.Columns[columnName].AllowDBNull)
@@ -392,7 +385,7 @@ namespace Serilog.Sinks.MSSqlServer
                     row[columnName] = DBNull.Value;
                     continue;
                 }
-                
+
                 if (TryChangeType(scalarValue.Value, columnType, out conversion))
                 {
                     row[columnName] = conversion;
@@ -430,12 +423,13 @@ namespace Serilog.Sinks.MSSqlServer
         /// <param name="disposing"></param>
         protected override void Dispose(bool disposing)
         {
-            _token.Cancel();
+            base.Dispose(disposing);
 
             if (_eventsTable != null)
+            {
                 _eventsTable.Dispose();
-
-            base.Dispose(disposing);
+                _eventsTable = null;
+            }
         }
     }
 }

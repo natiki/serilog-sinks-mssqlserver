@@ -1,3 +1,10 @@
+4.0.0
+ * Serilog 2.0
+ * [Documentation fix](https://github.com/serilog/serilog-sinks-mssqlserver/pull/32)
+
+2.0.33
+ * Option added to exclude redundant properties from serialized JSON in column LogEvent. (https://github.com/serilog/serilog-sinks-mssqlserver/pull/27)
+
 2.0.32
  * Safe conversion of data types. Also included selflog for bulk operation errors. (https://github.com/serilog/serilog-sinks-mssqlserver/pull/4)
 
